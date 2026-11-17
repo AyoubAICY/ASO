@@ -99,6 +99,95 @@ class ToolGuard:
         self._history: list[ToolRequest] = []
         self._quarantine: list[dict[str, Any]] = []
 
+    def create_framework_tool(
+        self,
+        tool_id: str,
+        context: ToolSecurityContext,
+        *,
+        operation: str | None = None,
+    ) -> Callable[..., Any]:
+        """Create a framework-callable that always dispatches through this guard."""
+        return self._create_framework_tool(tool_id, context, operation, None)
+
+    def _create_framework_tool(
+        self,
+        tool_id: str,
+        context: ToolSecurityContext,
+        operation: str | None,
+        dispatcher: Callable[[ToolRequest, ToolSecurityContext], Any] | None,
+    ) -> Callable[..., Any]:
+        if not isinstance(context, ToolSecurityContext):
+            raise TypeError("a trusted ToolSecurityContext is required")
+        definition, _ = self.registry.resolve(tool_id)
+        if tool_id not in context.authorized_tools:
+            raise PermissionError("tool is not authorized by the trusted context")
+
+        declared_operations = {item.lower() for item in definition.operations}
+        if operation is None and len(declared_operations) == 1:
+            operation = next(iter(declared_operations))
+        if operation is not None:
+            operation = operation.lower()
+            if declared_operations and operation not in declared_operations:
+                raise ValueError("operation is not declared for this tool")
+
+        properties = definition.input_schema.get("properties", {})
+        required = set(definition.input_schema.get("required", ()))
+        parameters = []
+        annotations: dict[str, Any] = {}
+        python_types = {
+            "string": str,
+            "integer": int,
+            "number": float,
+            "boolean": bool,
+            "object": dict,
+            "array": list,
+        }
+        for name, property_schema in properties.items():
+            if name == "operation" and operation is not None:
+                continue
+            schema_type = property_schema.get("type") if isinstance(property_schema, Mapping) else None
+            annotation = python_types.get(schema_type, Any)
+            default = inspect.Parameter.empty if name in required else None
+            parameters.append(inspect.Parameter(
+                name,
+                inspect.Parameter.KEYWORD_ONLY,
+                default=default,
+                annotation=annotation,
+            ))
+            annotations[name] = annotation
+
+        signature = inspect.Signature(parameters)
+
+        def guarded_tool(**arguments: Any) -> Any:
+            tool_arguments = dict(arguments)
+            if operation is not None:
+                tool_arguments["operation"] = operation
+            request = ToolRequest(
+                request_id=str(uuid.uuid4()),
+                agent_id=context.agent_id,
+                session_id=context.session_id,
+                task_id=str(uuid.uuid4()),
+                tool_id=tool_id,
+                purpose=definition.purpose,
+                reason=f"Framework invocation of guarded tool {definition.name}.",
+                arguments=tool_arguments,
+            )
+            result = dispatcher(request, context) if dispatcher is not None else self.execute(request, context)
+            decision = getattr(getattr(result, "decision", None), "value", getattr(result, "decision", None))
+            if decision != Decision.ALLOW_RESULT.value:
+                reasons = getattr(result, "reasons", ()) or getattr(result, "reason_codes", ())
+                raise PermissionError(f"ToolGuard blocked tool call: {reasons}")
+            return result.data
+
+        guarded_tool.__name__ = tool_id
+        guarded_tool.__qualname__ = tool_id
+        guarded_tool.__doc__ = definition.description
+        guarded_tool.__signature__ = signature
+        guarded_tool.__annotations__ = annotations | {"return": Any}
+        guarded_tool.__aso_tool_guard__ = self
+        guarded_tool.__aso_tool_id__ = tool_id
+        return guarded_tool
+
     def pre_guard(self, request: ToolRequest) -> ToolDecision:
         timestamp = datetime.now(timezone.utc).isoformat()
         reasons: list[str] = []
@@ -112,13 +201,15 @@ class ToolGuard:
 
         requested_operation = str(request.arguments.get("operation", "")).lower()
         declared_operations = {operation.lower() for operation in definition.operations}
+        schema_violations = self._schema_violations(request.arguments, definition.input_schema)
+        reasons.extend(schema_violations)
         if declared_operations and requested_operation not in declared_operations:
             reasons.append("operation_not_declared")
         if definition.forbidden_operations & set(map(str, request.arguments.values())):
             reasons.append("forbidden_operation")
         if definition.allowed_resources:
-            resources = {str(value) for value in request.arguments.values()}
-            if resources.isdisjoint(definition.allowed_resources):
+            resources = self._collect_resources(request.arguments)
+            if not resources or not resources.issubset(definition.allowed_resources):
                 reasons.append("resource_out_of_scope")
         if not request.purpose.strip() or not request.reason.strip():
             reasons.append("missing_purpose_or_reason")
@@ -277,3 +368,44 @@ class ToolGuard:
         expected = schema.get("type")
         types = {"object": dict, "array": list, "string": str, "number": (int, float), "boolean": bool}
         return expected not in types or isinstance(value, types[expected])
+
+    @staticmethod
+    def _collect_resources(arguments: Mapping[str, Any]) -> set[str]:
+        resources: set[str] = set()
+        for name, value in arguments.items():
+            if name.lower() == "operation":
+                continue
+            if isinstance(value, (str, int, float, bool)):
+                resources.add(str(value))
+        return resources
+
+    @classmethod
+    def _schema_violations(cls, arguments: Mapping[str, Any], schema: Mapping[str, Any]) -> list[str]:
+        if not schema:
+            return []
+
+        reasons: list[str] = []
+        properties = schema.get("properties") or {}
+        required = schema.get("required") or []
+
+        for field_name in required:
+            if field_name not in arguments:
+                reasons.append("missing_required_argument")
+
+        for name, definition in properties.items():
+            if name not in arguments:
+                continue
+            value = arguments[name]
+            expected_type = definition.get("type") if isinstance(definition, Mapping) else None
+            if expected_type == "string" and not isinstance(value, str):
+                reasons.append("argument_type_mismatch")
+            elif expected_type == "number" and not isinstance(value, (int, float)) or isinstance(value, bool):
+                reasons.append("argument_type_mismatch")
+            elif expected_type == "boolean" and not isinstance(value, bool):
+                reasons.append("argument_type_mismatch")
+            elif expected_type == "object" and not isinstance(value, Mapping):
+                reasons.append("argument_type_mismatch")
+            elif expected_type == "array" and not isinstance(value, (list, tuple, set, frozenset)):
+                reasons.append("argument_type_mismatch")
+
+        return reasons

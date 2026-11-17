@@ -1,6 +1,6 @@
-# ASO Tutorial
+# ASO Quick Start
 
-The former quick-start is now a full tutorial covering the current public API, constructor arguments, trusted contexts, guarded request flow, model configuration caveats and operational guidance.
+New to ASO? Start with the [Developer Integration Guide](docs/developer_integration.md). It explains the services, shows how to place `ToolGuard` in an agent's function-call path, and describes when to use the unified orchestrator versus a direct guard.
 
-Start here: [ASO Tutorial](docs/aso_tutorial.md)
+For detailed API contracts, request fields, memory setup, secret handling, and operational guidance, continue to the [ASO Tutorial](docs/aso_tutorial.md).
 

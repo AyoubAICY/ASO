@@ -6,7 +6,6 @@ the application through ``TOOL_GUARD_KEY`` or an external secret manager.
 
 from __future__ import annotations
 
-import base64
 import json
 import os
 import importlib
@@ -25,7 +24,7 @@ class EncryptedField:
     def __init__(self, key: str | bytes | None = None) -> None:
         configured = key or os.environ.get("TOOL_GUARD_KEY")
         if not configured:
-            raise RuntimeError("TOOL_GUARD_KEY must be configured")
+            raise RuntimeError("TOOL_GUARD_KEY must be configured for encrypted audit storage")
         raw = configured.encode() if isinstance(configured, str) else configured
         self._cipher = _fernet()(raw)
 

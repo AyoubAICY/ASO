@@ -8,6 +8,9 @@ import importlib
 import os
 import sqlite3
 import uuid
+import urllib.error
+import urllib.parse
+import urllib.request
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
@@ -29,6 +32,19 @@ from .memory_guard import CyberAI, MemoryGuard
 
 DECISIONS = {"accept", "deny", "quarantine"}
 VECTOR_PROVIDERS = {"qdrant", "pinecone", "weaviate", "milvus", "chroma", "faiss", "pgvector", "vespa"}
+
+
+def _scoped_key(request: AgentRequest, memory_id: str) -> str:
+    scope = json.dumps(
+        [request.tenant_id, request.agent_id, str(memory_id)],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"aso-memory:{scope}"))
+
+
+def _scoped_uuid(request: AgentRequest, memory_id: str) -> str:
+    return _scoped_key(request, memory_id)
 
 
 def _managed_provider_config(provider: str, config: dict[str, Any]) -> dict[str, Any]:
@@ -84,34 +100,39 @@ class SQLiteBackend(ApplicationManagedBackend):
                 """
                 CREATE TABLE IF NOT EXISTS memory_items (
                     memory_id TEXT PRIMARY KEY,
+                    tenant_id TEXT NOT NULL DEFAULT '',
                     agent_id TEXT NOT NULL,
                     encrypted_payload TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 )
                 """
             )
+            columns = {row[1] for row in self._connection.execute("PRAGMA table_info(memory_items)")}
+            if "tenant_id" not in columns:
+                self._connection.execute("ALTER TABLE memory_items ADD COLUMN tenant_id TEXT NOT NULL DEFAULT ''")
             self._connection.commit()
         return self._connection
 
     def execute(self, operation: str, request: AgentRequest, memory_id: str) -> Any:
         connection = self._connection_for()
+        scoped_id = _scoped_key(request, memory_id)
         if operation in {"write", "update"}:
             connection.execute(
-                "INSERT OR REPLACE INTO memory_items VALUES (?, ?, ?, ?)",
-                (memory_id, request.agent_id, request.data, datetime.now(timezone.utc).isoformat()),
+                "INSERT OR REPLACE INTO memory_items (memory_id, tenant_id, agent_id, encrypted_payload, updated_at) VALUES (?, ?, ?, ?, ?)",
+                (scoped_id, request.tenant_id, request.agent_id, request.data, datetime.now(timezone.utc).isoformat()),
             )
             connection.commit()
             return None
         if operation in {"read", "search"}:
             row = connection.execute(
-                "SELECT encrypted_payload FROM memory_items WHERE memory_id = ? AND agent_id = ?",
-                (memory_id, request.agent_id),
+                "SELECT encrypted_payload FROM memory_items WHERE memory_id = ? AND tenant_id = ? AND agent_id = ?",
+                (scoped_id, request.tenant_id, request.agent_id),
             ).fetchone()
             return row[0] if row else None
         if operation == "delete":
             cursor = connection.execute(
-                "DELETE FROM memory_items WHERE memory_id = ? AND agent_id = ?",
-                (memory_id, request.agent_id),
+                "DELETE FROM memory_items WHERE memory_id = ? AND tenant_id = ? AND agent_id = ?",
+                (scoped_id, request.tenant_id, request.agent_id),
             )
             connection.commit()
             return cursor.rowcount > 0
@@ -125,6 +146,17 @@ class SQLiteBackend(ApplicationManagedBackend):
 
 def _json_payload(request: AgentRequest) -> str:
     return json.dumps(request.data, ensure_ascii=False, separators=(",", ":"))
+
+
+def _encode_backend_payload(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def _decode_backend_payload(value: str) -> Any:
+    try:
+        return json.loads(value)
+    except (TypeError, ValueError):
+        return value
 
 
 class QdrantBackend(ApplicationManagedBackend):
@@ -142,19 +174,20 @@ class QdrantBackend(ApplicationManagedBackend):
 
     def execute(self, operation: str, request: AgentRequest, memory_id: str) -> Any:
         client = self._client
+        scoped_id = _scoped_uuid(request, memory_id)
         if operation in {"write", "update"}:
             vector = AgentDB._embedding(request.data)
-            payload = {"ciphertext": request.data, "agent_id": request.agent_id}
+            payload = {"ciphertext": request.data, "agent_id": request.agent_id, "tenant_id": request.tenant_id}
             point = importlib.import_module("qdrant_client.http.models").PointStruct(
-                id=memory_id, vector=vector, payload=payload
+                id=scoped_id, vector=vector, payload=payload
             )
             client.upsert(collection_name=self.collection, points=[point], wait=True)
             return None
         if operation in {"read", "search"}:
-            result = client.retrieve(collection_name=self.collection, ids=[memory_id], with_payload=True)
+            result = client.retrieve(collection_name=self.collection, ids=[scoped_id], with_payload=True)
             return result[0].payload.get("ciphertext") if result else None
         if operation == "delete":
-            client.delete(collection_name=self.collection, points_selector=[memory_id], wait=True)
+            client.delete(collection_name=self.collection, points_selector=[scoped_id], wait=True)
             return True
         raise ValueError(f"unsupported Qdrant operation: {operation}")
 
@@ -174,15 +207,18 @@ class PineconeBackend(ApplicationManagedBackend):
 
     def execute(self, operation: str, request: AgentRequest, memory_id: str) -> Any:
         index = self._index
+        scoped_id = _scoped_key(request, memory_id)
         if operation in {"write", "update"}:
-            index.upsert([(memory_id, AgentDB._embedding(request.data), {"ciphertext": request.data})], namespace=self.namespace)
+            index.upsert([(scoped_id, AgentDB._embedding(request.data), {
+                "ciphertext": request.data, "agent_id": request.agent_id, "tenant_id": request.tenant_id,
+            })], namespace=self.namespace)
             return None
         if operation in {"read", "search"}:
-            result = index.fetch([memory_id], namespace=self.namespace)
-            vector = result.vectors.get(memory_id)
+            result = index.fetch([scoped_id], namespace=self.namespace)
+            vector = result.vectors.get(scoped_id)
             return vector.metadata.get("ciphertext") if vector else None
         if operation == "delete":
-            index.delete(ids=[memory_id], namespace=self.namespace)
+            index.delete(ids=[scoped_id], namespace=self.namespace)
             return True
         raise ValueError(f"unsupported Pinecone operation: {operation}")
 
@@ -200,15 +236,19 @@ class S3Backend(ApplicationManagedBackend):
         return f"{self.prefix}/{memory_id}.json"
 
     def execute(self, operation: str, request: AgentRequest, memory_id: str) -> Any:
-        client, key = self._client, self._key(memory_id)
+        client, key = self._client, self._key(_scoped_key(request, memory_id))
         if operation in {"write", "update"}:
             client.put_object(Bucket=self.bucket, Key=key, Body=_json_payload(request).encode(), ContentType="application/json", ServerSideEncryption="AES256")
             return None
         if operation in {"read", "search"}:
             try:
                 return json.loads(client.get_object(Bucket=self.bucket, Key=key)["Body"].read().decode())
-            except client.exceptions.NoSuchKey:
-                return None
+            except Exception as error:
+                response = getattr(error, "response", {})
+                code = response.get("Error", {}).get("Code")
+                if code in {"NoSuchKey", "404"}:
+                    return None
+                raise
         if operation == "delete":
             client.delete_object(Bucket=self.bucket, Key=key)
             return True
@@ -229,7 +269,7 @@ class RedisBackend(ApplicationManagedBackend):
         self._client.ping()
 
     def execute(self, operation: str, request: AgentRequest, memory_id: str) -> Any:
-        client, key = self._client, f"{self.namespace}:{memory_id}"
+        client, key = self._client, f"{self.namespace}:{_scoped_key(request, memory_id)}"
         if operation in {"write", "update"}:
             client.set(key, _json_payload(request))
             return None
@@ -257,14 +297,19 @@ class MongoBackend(ApplicationManagedBackend):
 
     def execute(self, operation: str, request: AgentRequest, memory_id: str) -> Any:
         collection = self._collection
+        scoped_id = _scoped_key(request, memory_id)
         if operation in {"write", "update"}:
-            collection.replace_one({"_id": memory_id}, {"_id": memory_id, "payload": request.data}, upsert=True)
+            collection.replace_one(
+                {"_id": scoped_id},
+                {"_id": scoped_id, "tenant_id": request.tenant_id, "agent_id": request.agent_id, "payload": request.data},
+                upsert=True,
+            )
             return None
         if operation in {"read", "search"}:
-            item = collection.find_one({"_id": memory_id})
+            item = collection.find_one({"_id": scoped_id, "tenant_id": request.tenant_id, "agent_id": request.agent_id})
             return item.get("payload") if item else None
         if operation == "delete":
-            return collection.delete_one({"_id": memory_id}).deleted_count > 0
+            return collection.delete_one({"_id": scoped_id, "tenant_id": request.tenant_id, "agent_id": request.agent_id}).deleted_count > 0
         raise ValueError(f"unsupported MongoDB operation: {operation}")
 
 
@@ -280,13 +325,23 @@ class DynamoDBBackend(ApplicationManagedBackend):
 
     def execute(self, operation: str, request: AgentRequest, memory_id: str) -> Any:
         table = self._table
+        scoped_id = _scoped_key(request, memory_id)
         if operation in {"write", "update"}:
-            table.put_item(Item={"memory_id": memory_id, "payload": request.data})
+            table.put_item(Item={
+                "memory_id": scoped_id, "tenant_id": request.tenant_id,
+                "agent_id": request.agent_id, "payload": request.data,
+            })
             return None
         if operation in {"read", "search"}:
-            return table.get_item(Key={"memory_id": memory_id}).get("Item", {}).get("payload")
+            item = table.get_item(Key={"memory_id": scoped_id}).get("Item", {})
+            if item.get("tenant_id") != request.tenant_id or item.get("agent_id") != request.agent_id:
+                return None
+            return item.get("payload")
         if operation == "delete":
-            table.delete_item(Key={"memory_id": memory_id})
+            item = table.get_item(Key={"memory_id": scoped_id}).get("Item", {})
+            if item.get("tenant_id") != request.tenant_id or item.get("agent_id") != request.agent_id:
+                return False
+            table.delete_item(Key={"memory_id": scoped_id})
             return True
         raise ValueError(f"unsupported DynamoDB operation: {operation}")
 
@@ -307,16 +362,28 @@ class ElasticsearchBackend(ApplicationManagedBackend):
 
     def execute(self, operation: str, request: AgentRequest, memory_id: str) -> Any:
         client = self._client
+        scoped_id = _scoped_key(request, memory_id)
         if operation in {"write", "update"}:
-            client.index(index=self.index, id=memory_id, document={"payload": request.data}, refresh=True)
+            client.index(index=self.index, id=scoped_id, document={
+                "payload": request.data, "tenant_id": request.tenant_id, "agent_id": request.agent_id,
+            }, refresh=True)
             return None
         if operation in {"read", "search"}:
             try:
-                return client.get(index=self.index, id=memory_id)["_source"].get("payload")
+                source = client.get(index=self.index, id=scoped_id)["_source"]
+                if source.get("tenant_id") != request.tenant_id or source.get("agent_id") != request.agent_id:
+                    return None
+                return source.get("payload")
             except Exception:
                 return None
         if operation == "delete":
-            client.delete(index=self.index, id=memory_id, refresh=True, ignore=[404])
+            try:
+                source = client.get(index=self.index, id=scoped_id)["_source"]
+            except Exception:
+                return False
+            if source.get("tenant_id") != request.tenant_id or source.get("agent_id") != request.agent_id:
+                return False
+            client.delete(index=self.index, id=scoped_id, refresh=True, ignore=[404])
             return True
         raise ValueError(f"unsupported Elasticsearch operation: {operation}")
 
@@ -336,14 +403,31 @@ class WeaviateBackend(ApplicationManagedBackend):
         self.collection = self.client.collections.get(collection)
 
     def execute(self, operation: str, request: AgentRequest, memory_id: str) -> Any:
+        scoped_id = _scoped_uuid(request, memory_id)
         if operation in {"write", "update"}:
-            self.collection.data.insert(properties={"ciphertext": request.data, "agent_id": request.agent_id}, uuid=memory_id)
+            properties = {
+                "ciphertext": request.data,
+                "agent_id": request.agent_id,
+                "tenant_id": request.tenant_id,
+            }
+            self.collection.data.insert(properties=properties, uuid=scoped_id)
             return None
         if operation in {"read", "search"}:
-            item = self.collection.query.fetch_objects(filters=None, limit=1)
-            return item.objects[0].properties.get("ciphertext") if item.objects else None
+            item = self.collection.query.fetch_object_by_id(uuid=scoped_id)
+            if item is None:
+                return None
+            properties = item.properties
+            if properties.get("agent_id") != request.agent_id or properties.get("tenant_id") != request.tenant_id:
+                return None
+            return properties.get("ciphertext")
         if operation == "delete":
-            self.collection.data.delete_by_id(memory_id)
+            item = self.collection.query.fetch_object_by_id(uuid=scoped_id)
+            if item is None:
+                return False
+            properties = item.properties
+            if properties.get("agent_id") != request.agent_id or properties.get("tenant_id") != request.tenant_id:
+                return False
+            self.collection.data.delete_by_id(scoped_id)
             return True
         raise ValueError(f"unsupported Weaviate operation: {operation}")
 
@@ -356,16 +440,33 @@ class MilvusBackend(ApplicationManagedBackend):
         self.collection = module.Collection(collection)
 
     def execute(self, operation: str, request: AgentRequest, memory_id: str) -> Any:
+        scoped_id = _scoped_key(request, memory_id)
         if operation in {"write", "update"}:
             vector = AgentDB._embedding(request.data)
-            self.collection.insert([[memory_id, vector, request.data]])
+            payload = json.dumps({
+                "ciphertext": request.data,
+                "tenant_id": request.tenant_id,
+                "agent_id": request.agent_id,
+            }, separators=(",", ":"))
+            self.collection.insert([[scoped_id, vector, payload]])
             self.collection.flush()
             return None
         if operation in {"read", "search"}:
-            rows = self.collection.query(expr=f'id == "{memory_id}"', output_fields=["payload"])
-            return rows[0].get("payload") if rows else None
+            rows = self.collection.query(expr=f'id == "{scoped_id}"', output_fields=["payload"])
+            if not rows:
+                return None
+            stored = json.loads(rows[0].get("payload", "{}"))
+            if stored.get("agent_id") != request.agent_id or stored.get("tenant_id") != request.tenant_id:
+                return None
+            return stored.get("ciphertext")
         if operation == "delete":
-            self.collection.delete(f'id == "{memory_id}"')
+            rows = self.collection.query(expr=f'id == "{scoped_id}"', output_fields=["payload"])
+            if not rows:
+                return False
+            stored = json.loads(rows[0].get("payload", "{}"))
+            if stored.get("agent_id") != request.agent_id or stored.get("tenant_id") != request.tenant_id:
+                return False
+            self.collection.delete(f'id == "{scoped_id}"')
             return True
         raise ValueError(f"unsupported Milvus operation: {operation}")
 
@@ -376,14 +477,30 @@ class ChromaBackend(ApplicationManagedBackend):
         self.collection = module.HttpClient(host=host, port=port).get_or_create_collection(collection)
 
     def execute(self, operation: str, request: AgentRequest, memory_id: str) -> Any:
+        scoped_id = _scoped_key(request, memory_id)
         if operation in {"write", "update"}:
-            self.collection.upsert(ids=[memory_id], documents=[_json_payload(request)], metadatas=[{"agent_id": request.agent_id}])
+            self.collection.upsert(
+                ids=[scoped_id],
+                documents=[json.dumps(request.data, ensure_ascii=False)],
+                metadatas=[{"agent_id": request.agent_id, "tenant_id": request.tenant_id}],
+            )
             return None
         if operation in {"read", "search"}:
-            result = self.collection.get(ids=[memory_id], include=["documents"])
-            return json.loads(result["documents"][0]) if result.get("documents") else None
+            result = self.collection.get(ids=[scoped_id], include=["documents", "metadatas"])
+            if not result.get("documents"):
+                return None
+            metadata = result.get("metadatas", [{}])[0] or {}
+            if metadata.get("agent_id") != request.agent_id or metadata.get("tenant_id") != request.tenant_id:
+                return None
+            return json.loads(result["documents"][0])
         if operation == "delete":
-            self.collection.delete(ids=[memory_id])
+            result = self.collection.get(ids=[scoped_id], include=["metadatas"])
+            if not result.get("ids"):
+                return False
+            metadata = result.get("metadatas", [{}])[0] or {}
+            if metadata.get("agent_id") != request.agent_id or metadata.get("tenant_id") != request.tenant_id:
+                return False
+            self.collection.delete(ids=[scoped_id])
             return True
         raise ValueError(f"unsupported Chroma operation: {operation}")
 
@@ -392,43 +509,111 @@ class FaissBackend(ApplicationManagedBackend):
     def __init__(self, index_path: str, dimensions: int = 32) -> None:
         module = _required_module("faiss", "faiss-cpu")
         self.module, self.index_path, self.dimensions = module, index_path, dimensions
-        self.index = module.read_index(index_path) if Path(index_path).exists() else module.IndexFlatL2(dimensions)
-        self.records: dict[int, Any] = {}
+        self.records_path = Path(f"{index_path}.records.json")
+        self.records: dict[str, dict[str, Any]] = {}
+        if self.records_path.exists():
+            self.records = json.loads(self.records_path.read_text(encoding="utf-8"))
+        self.index = module.IndexFlatL2(dimensions)
+        self._rebuild_index()
+
+    def _rebuild_index(self) -> None:
+        import numpy
+
+        self.index = self.module.IndexFlatL2(self.dimensions)
+        self.record_ids = sorted(self.records)
+        if self.record_ids:
+            vectors = [self.records[key]["vector"] for key in self.record_ids]
+            self.index.add(numpy.asarray(vectors, dtype="float32"))
+
+    def _persist(self) -> None:
+        self.records_path.parent.mkdir(parents=True, exist_ok=True)
+        self.records_path.write_text(json.dumps(self.records), encoding="utf-8")
+        self.module.write_index(self.index, str(self.index_path))
 
     def execute(self, operation: str, request: AgentRequest, memory_id: str) -> Any:
+        scoped_id = _scoped_key(request, memory_id)
         if operation in {"write", "update"}:
-            self.index.add(__import__("numpy").array([AgentDB._embedding(request.data)], dtype="float32"))
-            self.records[self.index.ntotal - 1] = request.data
-            self.module.write_index(self.index, self.index_path)
+            self.records[scoped_id] = {
+                "tenant_id": request.tenant_id,
+                "agent_id": request.agent_id,
+                "payload": request.data,
+                "vector": AgentDB._embedding(request.data, self.dimensions),
+            }
+            self._rebuild_index()
+            self._persist()
             return None
         if operation in {"read", "search"}:
-            return next(iter(self.records.values()), None)
+            record = self.records.get(scoped_id)
+            if not record or record["tenant_id"] != request.tenant_id or record["agent_id"] != request.agent_id:
+                return None
+            return record["payload"]
         if operation == "delete":
+            record = self.records.get(scoped_id)
+            if not record or record["tenant_id"] != request.tenant_id or record["agent_id"] != request.agent_id:
+                return False
+            del self.records[scoped_id]
+            self._rebuild_index()
+            self._persist()
             return True
         raise ValueError(f"unsupported FAISS operation: {operation}")
 
 
 class SQLBackend(ApplicationManagedBackend):
-    def __init__(self, url: str, table: str = "agent_memory") -> None:
+    def __init__(self, url: str, table: str = "agent_memory", schema: str | None = None) -> None:
+        if not url:
+            raise SDKUnavailable("a SQLAlchemy database URL is required")
         sqlalchemy = _required_module("sqlalchemy")
         self.engine = sqlalchemy.create_engine(url, pool_pre_ping=True, future=True)
-        self.table = table
+        self.sqlalchemy = sqlalchemy
+        metadata = sqlalchemy.MetaData()
+        self.table = sqlalchemy.Table(
+            table,
+            metadata,
+            sqlalchemy.Column("memory_id", sqlalchemy.String(36), primary_key=True),
+            sqlalchemy.Column("agent_id", sqlalchemy.String(255), nullable=False),
+            sqlalchemy.Column("payload", sqlalchemy.Text, nullable=False),
+            sqlalchemy.Column("updated_at", sqlalchemy.String(64), nullable=False),
+            schema=schema,
+        )
         with self.engine.begin() as connection:
-            connection.exec_driver_sql(f"CREATE TABLE IF NOT EXISTS {table} (memory_id VARCHAR(255) PRIMARY KEY, agent_id VARCHAR(255) NOT NULL, payload TEXT NOT NULL, updated_at VARCHAR(64) NOT NULL)")
+            metadata.create_all(connection)
 
     def execute(self, operation: str, request: AgentRequest, memory_id: str) -> Any:
-        text = _required_module("sqlalchemy").text
+        table = self.table
+        scoped_id = _scoped_key(request, memory_id)
+        select = self.sqlalchemy.select
         if operation in {"write", "update"}:
             with self.engine.begin() as connection:
-                connection.execute(text(f"MERGE INTO {self.table} (memory_id, agent_id, payload, updated_at) KEY(memory_id) VALUES (:id, :agent, :payload, :updated)"), {"id": memory_id, "agent": request.agent_id, "payload": request.data, "updated": datetime.now(timezone.utc).isoformat()})
+                existing = connection.execute(
+                    select(table.c.memory_id).where(table.c.memory_id == scoped_id)
+                ).first()
+                values = {
+                    "agent_id": request.agent_id,
+                    "payload": _encode_backend_payload(request.data),
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }
+                if existing:
+                    connection.execute(table.update().where(table.c.memory_id == scoped_id).values(**values))
+                else:
+                    connection.execute(table.insert().values(memory_id=scoped_id, **values))
             return None
         if operation in {"read", "search"}:
             with self.engine.connect() as connection:
-                row = connection.execute(text(f"SELECT payload FROM {self.table} WHERE memory_id=:id AND agent_id=:agent"), {"id": memory_id, "agent": request.agent_id}).first()
-            return row[0] if row else None
+                row = connection.execute(
+                    select(table.c.payload).where(
+                        table.c.memory_id == scoped_id,
+                        table.c.agent_id == request.agent_id,
+                    )
+                ).first()
+            return _decode_backend_payload(row[0]) if row else None
         if operation == "delete":
             with self.engine.begin() as connection:
-                result = connection.execute(text(f"DELETE FROM {self.table} WHERE memory_id=:id AND agent_id=:agent"), {"id": memory_id, "agent": request.agent_id})
+                result = connection.execute(
+                    table.delete().where(
+                        table.c.memory_id == scoped_id,
+                        table.c.agent_id == request.agent_id,
+                    )
+                )
             return result.rowcount > 0
         raise ValueError(f"unsupported SQL operation: {operation}")
 
@@ -439,15 +624,25 @@ class CouchDBBackend(ApplicationManagedBackend):
         self.database = module.Server(url, auth=(username, password))[database]
 
     def execute(self, operation: str, request: AgentRequest, memory_id: str) -> Any:
+        scoped_id = _scoped_key(request, memory_id)
         if operation in {"write", "update"}:
-            self.database.save({"_id": memory_id, "agent_id": request.agent_id, "payload": request.data})
+            document = self.database.get(scoped_id)
+            if document:
+                document.update({"agent_id": request.agent_id, "tenant_id": request.tenant_id, "payload": request.data})
+                self.database.save(document)
+            else:
+                self.database.save({"_id": scoped_id, "agent_id": request.agent_id, "tenant_id": request.tenant_id, "payload": request.data})
             return None
         if operation in {"read", "search"}:
-            return self.database.get(memory_id, {}).get("payload")
+            document = self.database.get(scoped_id)
+            if not document or document.get("agent_id") != request.agent_id or document.get("tenant_id") != request.tenant_id:
+                return None
+            return document.get("payload")
         if operation == "delete":
-            document = self.database.get(memory_id)
-            if document:
-                self.database.delete(document)
+            document = self.database.get(scoped_id)
+            if not document or document.get("agent_id") != request.agent_id or document.get("tenant_id") != request.tenant_id:
+                return False
+            self.database.delete(document)
             return bool(document)
         raise ValueError(f"unsupported CouchDB operation: {operation}")
 
@@ -458,21 +653,43 @@ class FirestoreBackend(ApplicationManagedBackend):
         self.document = firestore.Client().collection(collection)
 
     def execute(self, operation: str, request: AgentRequest, memory_id: str) -> Any:
-        document = self.document.document(memory_id)
+        document = self.document.document(_scoped_key(request, memory_id))
         if operation in {"write", "update"}:
-            document.set({"agent_id": request.agent_id, "payload": request.data})
+            document.set({"tenant_id": request.tenant_id, "agent_id": request.agent_id, "payload": request.data})
             return None
         if operation in {"read", "search"}:
             snapshot = document.get()
-            return snapshot.to_dict().get("payload") if snapshot.exists else None
+            stored = snapshot.to_dict() if snapshot.exists else None
+            if not stored or stored.get("agent_id") != request.agent_id or stored.get("tenant_id") != request.tenant_id:
+                return None
+            return stored.get("payload")
         if operation == "delete":
+            snapshot = document.get()
+            stored = snapshot.to_dict() if snapshot.exists else None
+            if not stored or stored.get("agent_id") != request.agent_id or stored.get("tenant_id") != request.tenant_id:
+                return False
             document.delete()
             return True
         raise ValueError(f"unsupported Firestore operation: {operation}")
 
 
 class ValkeyBackend(RedisBackend):
-    pass
+    def __init__(self, namespace: str = "memory", url: str | None = None) -> None:
+        self.namespace = namespace.strip(":")
+        self.url = url or os.environ.get("VALKEY_URL")
+        try:
+            module = importlib.import_module("valkey")
+            client_type = module.Valkey
+        except ImportError:
+            try:
+                module = importlib.import_module("redis")
+                client_type = module.Redis
+            except ImportError as error:
+                raise SDKUnavailable("install valkey or redis for ValkeyBackend") from error
+        if not self.url:
+            raise SDKUnavailable("VALKEY_URL is required")
+        self._client = client_type.from_url(self.url, decode_responses=True)
+        self._client.ping()
 
 
 class MemcachedBackend(ApplicationManagedBackend):
@@ -482,14 +699,15 @@ class MemcachedBackend(ApplicationManagedBackend):
         self.client.version()
 
     def execute(self, operation: str, request: AgentRequest, memory_id: str) -> Any:
+        key = _scoped_key(request, memory_id)
         if operation in {"write", "update"}:
-            self.client.set(memory_id, _json_payload(request).encode())
+            self.client.set(key, _json_payload(request).encode())
             return None
         if operation in {"read", "search"}:
-            value = self.client.get(memory_id)
+            value = self.client.get(key)
             return json.loads(value.decode()) if value else None
         if operation == "delete":
-            return bool(self.client.delete(memory_id))
+            return bool(self.client.delete(key))
         raise ValueError(f"unsupported Memcached operation: {operation}")
 
 
@@ -500,21 +718,40 @@ class Neo4jBackend(ApplicationManagedBackend):
         self.driver.verify_connectivity()
 
     def execute(self, operation: str, request: AgentRequest, memory_id: str) -> Any:
+        scoped_id = _scoped_key(request, memory_id)
         with self.driver.session() as session:
             if operation in {"write", "update"}:
-                session.run("MERGE (m:Memory {id: $id}) SET m.agent_id=$agent, m.payload=$payload", id=memory_id, agent=request.agent_id, payload=request.data).consume()
+                session.run(
+                    "MERGE (m:Memory {id: $id}) SET m.agent_id=$agent, m.tenant_id=$tenant, m.payload=$payload",
+                    id=scoped_id, agent=request.agent_id, tenant=request.tenant_id, payload=request.data,
+                ).consume()
                 return None
             if operation in {"read", "search"}:
-                record = session.run("MATCH (m:Memory {id: $id, agent_id: $agent}) RETURN m.payload AS payload", id=memory_id, agent=request.agent_id).single()
+                record = session.run(
+                    "MATCH (m:Memory {id: $id, agent_id: $agent, tenant_id: $tenant}) RETURN m.payload AS payload",
+                    id=scoped_id, agent=request.agent_id, tenant=request.tenant_id,
+                ).single()
                 return record["payload"] if record else None
             if operation == "delete":
-                session.run("MATCH (m:Memory {id: $id, agent_id: $agent}) DETACH DELETE m", id=memory_id, agent=request.agent_id).consume()
-                return True
+                result = session.run(
+                    "MATCH (m:Memory {id: $id, agent_id: $agent, tenant_id: $tenant}) WITH m DETACH DELETE m RETURN count(*) AS deleted",
+                    id=scoped_id, agent=request.agent_id, tenant=request.tenant_id,
+                ).single()
+                return bool(result and result["deleted"])
         raise ValueError(f"unsupported Neo4j operation: {operation}")
 
 
 class NeptuneBackend(Neo4jBackend):
-    pass
+    def __init__(self, uri: str, username: str | None = None, password: str | None = None) -> None:
+        module = _required_module("neo4j")
+        auth = (username, password) if username and password else None
+        self.driver = module.GraphDatabase.driver(
+            uri,
+            auth=auth,
+            connection_timeout=10,
+            encrypted=True,
+        )
+        self.driver.verify_connectivity()
 
 
 class ArangoBackend(ApplicationManagedBackend):
@@ -523,26 +760,61 @@ class ArangoBackend(ApplicationManagedBackend):
         self.collection = module.ArangoClient(hosts=url).db(database, username=username, password=password).collection(collection)
 
     def execute(self, operation: str, request: AgentRequest, memory_id: str) -> Any:
+        scoped_id = _scoped_key(request, memory_id)
         if operation in {"write", "update"}:
-            self.collection.insert({"_key": memory_id, "agent_id": request.agent_id, "payload": request.data}, overwrite=True)
+            self.collection.insert({
+                "_key": scoped_id, "tenant_id": request.tenant_id,
+                "agent_id": request.agent_id, "payload": request.data,
+            }, overwrite=True)
             return None
         if operation in {"read", "search"}:
-            item = self.collection.get(memory_id)
-            return item.get("payload") if item else None
+            item = self.collection.get(scoped_id)
+            if not item or item.get("agent_id") != request.agent_id or item.get("tenant_id") != request.tenant_id:
+                return None
+            return item.get("payload")
         if operation == "delete":
-            self.collection.delete(memory_id, ignore_missing=True)
+            item = self.collection.get(scoped_id)
+            if not item or item.get("agent_id") != request.agent_id or item.get("tenant_id") != request.tenant_id:
+                return False
+            self.collection.delete(scoped_id, ignore_missing=True)
             return True
         raise ValueError(f"unsupported ArangoDB operation: {operation}")
 
 
 class TigerGraphBackend(ApplicationManagedBackend):
-    def __init__(self, host: str, username: str, password: str, graph: str) -> None:
+    def __init__(self, host: str, username: str, password: str, graph: str, vertex_type: str = "Memory") -> None:
         module = _required_module("pyTigerGraph")
         self.client = module.TigerGraphConnection(host=host, username=username, password=password, graphname=graph)
         self.client.gsql("INTERPRET QUERY () FOR GRAPH %s { PRINT 1; }" % graph)
+        self.vertex_type = vertex_type
 
     def execute(self, operation: str, request: AgentRequest, memory_id: str) -> Any:
-        raise SDKUnavailable("TigerGraph memory operations require an application-defined graph schema")
+        scoped_id = _scoped_key(request, memory_id)
+        if operation in {"write", "update"}:
+            self.client.upsertVertex(self.vertex_type, scoped_id, {
+                "agent_id": request.agent_id,
+                "tenant_id": request.tenant_id,
+                "payload": request.data,
+            })
+            return None
+        if operation in {"read", "search"}:
+            result = self.client.getVertex(self.vertex_type, scoped_id)
+            if not result:
+                return None
+            attributes = result.get("attributes", result)
+            if attributes.get("agent_id") != request.agent_id or attributes.get("tenant_id") != request.tenant_id:
+                return None
+            return attributes.get("payload")
+        if operation == "delete":
+            result = self.client.getVertex(self.vertex_type, scoped_id)
+            if not result:
+                return False
+            attributes = result.get("attributes", result)
+            if attributes.get("agent_id") != request.agent_id or attributes.get("tenant_id") != request.tenant_id:
+                return False
+            self.client.delVerticesById(self.vertex_type, [scoped_id])
+            return True
+        raise ValueError(f"unsupported TigerGraph operation: {operation}")
 
 
 class LangGraphBackend(ApplicationManagedBackend):
@@ -552,7 +824,13 @@ class LangGraphBackend(ApplicationManagedBackend):
         self.graph = graph
 
     def execute(self, operation: str, request: AgentRequest, memory_id: str) -> Any:
-        return self.graph.invoke({"operation": operation, "memory_id": memory_id, "payload": request.data, "agent_id": request.agent_id})
+        return self.graph.invoke({
+            "operation": operation,
+            "memory_id": _scoped_key(request, memory_id),
+            "payload": request.data,
+            "agent_id": request.agent_id,
+            "tenant_id": request.tenant_id,
+        })
 
 
 class SolrBackend(ApplicationManagedBackend):
@@ -562,14 +840,21 @@ class SolrBackend(ApplicationManagedBackend):
         self.client.ping()
 
     def execute(self, operation: str, request: AgentRequest, memory_id: str) -> Any:
+        scoped_id = _scoped_key(request, memory_id)
         if operation in {"write", "update"}:
-            self.client.add([{"id": memory_id, "agent_id_s": request.agent_id, "payload_s": json.dumps(request.data)}], commit=True)
+            self.client.add([{
+                "id": scoped_id, "agent_id_s": request.agent_id,
+                "tenant_id_s": request.tenant_id, "payload_s": json.dumps(request.data),
+            }], commit=True)
             return None
         if operation in {"read", "search"}:
-            results = self.client.search(f'id:"{memory_id}" AND agent_id_s:"{request.agent_id}"', rows=1)
+            results = self.client.search(
+                f'id:"{scoped_id}" AND agent_id_s:"{request.agent_id}" AND tenant_id_s:"{request.tenant_id}"',
+                rows=1,
+            )
             return json.loads(results.docs[0]["payload_s"]) if results.docs else None
         if operation == "delete":
-            self.client.delete(id=memory_id, commit=True)
+            self.client.delete(q=f'id:"{scoped_id}" AND agent_id_s:"{request.agent_id}" AND tenant_id_s:"{request.tenant_id}"', commit=True)
             return True
         raise ValueError(f"unsupported Solr operation: {operation}")
 
@@ -586,6 +871,74 @@ class OpenSearchBackend(ElasticsearchBackend):
             raise SDKUnavailable("OpenSearch endpoint is unavailable")
 
 
+class VespaBackend(ApplicationManagedBackend):
+    """Small document CRUD adapter for Vespa's HTTP document API."""
+
+    def __init__(
+        self,
+        url: str,
+        schema: str = "memory",
+        namespace: str = "aso",
+        timeout: float = 10,
+        api_key: str | None = None,
+    ) -> None:
+        if not url:
+            raise SDKUnavailable("VESPA_URL is required")
+        self.url = url.rstrip("/")
+        self.schema = schema
+        self.namespace = namespace
+        self.timeout = timeout
+        self.api_key = api_key
+
+    def _document_url(self, memory_id: str) -> str:
+        doc_id = urllib.parse.quote(memory_id, safe="")
+        return f"{self.url}/document/v1/{self.namespace}/{self.schema}/docid/{doc_id}"
+
+    def _request(self, method: str, memory_id: str, body: dict[str, Any] | None = None) -> Any:
+        data = json.dumps(body).encode("utf-8") if body is not None else None
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        request = urllib.request.Request(
+            self._document_url(memory_id),
+            data=data,
+            headers=headers,
+            method=method,
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                payload = response.read()
+                return json.loads(payload) if payload else {}
+        except urllib.error.HTTPError as error:
+            if error.code == 404:
+                return None
+            raise
+
+    def execute(self, operation: str, request: AgentRequest, memory_id: str) -> Any:
+        scoped_id = _scoped_key(request, memory_id)
+        if operation in {"write", "update"}:
+            self._request("PUT", scoped_id, {"fields": {
+                "payload": request.data,
+                "agent_id": request.agent_id,
+                "tenant_id": request.tenant_id,
+            }})
+            return None
+        if operation in {"read", "search"}:
+            result = self._request("GET", scoped_id)
+            fields = result.get("fields", {}) if result else {}
+            if fields.get("agent_id") != request.agent_id or fields.get("tenant_id") != request.tenant_id:
+                return None
+            return fields.get("payload")
+        if operation == "delete":
+            result = self._request("GET", scoped_id)
+            fields = result.get("fields", {}) if result else {}
+            if fields.get("agent_id") != request.agent_id or fields.get("tenant_id") != request.tenant_id:
+                return False
+            self._request("DELETE", scoped_id)
+            return True
+        raise ValueError(f"unsupported Vespa operation: {operation}")
+
+
 class GCSBackend(ApplicationManagedBackend):
     def __init__(self, bucket: str, prefix: str = "memory") -> None:
         storage = _required_module("google.cloud.storage")
@@ -596,14 +949,17 @@ class GCSBackend(ApplicationManagedBackend):
         return self.bucket.blob(f"{self.prefix}/{memory_id}.json")
 
     def execute(self, operation: str, request: AgentRequest, memory_id: str) -> Any:
-        blob = self._blob(memory_id)
+        blob = self._blob(_scoped_key(request, memory_id))
         if operation in {"write", "update"}:
             blob.upload_from_string(_json_payload(request), content_type="application/json")
             return None
         if operation in {"read", "search"}:
             try:
                 return json.loads(blob.download_as_text())
-            except Exception:
+            except Exception as error:
+                not_found = getattr(importlib.import_module("google.api_core.exceptions"), "NotFound")
+                if not isinstance(error, not_found):
+                    raise
                 return None
         if operation == "delete":
             blob.delete()
@@ -617,14 +973,17 @@ class AzureBlobBackend(ApplicationManagedBackend):
         self.container = module.BlobServiceClient(account_url=account_url, credential=credential).get_container_client(container)
 
     def execute(self, operation: str, request: AgentRequest, memory_id: str) -> Any:
-        blob = self.container.get_blob_client(f"{memory_id}.json")
+        blob = self.container.get_blob_client(f"{_scoped_key(request, memory_id)}.json")
         if operation in {"write", "update"}:
             blob.upload_blob(_json_payload(request).encode(), overwrite=True)
             return None
         if operation in {"read", "search"}:
             try:
                 return json.loads(blob.download_blob().readall().decode())
-            except Exception:
+            except Exception as error:
+                not_found = getattr(importlib.import_module("azure.core.exceptions"), "ResourceNotFoundError")
+                if not isinstance(error, not_found):
+                    raise
                 return None
         if operation == "delete":
             blob.delete_blob(delete_snapshots="include")
@@ -635,27 +994,44 @@ class AzureBlobBackend(ApplicationManagedBackend):
 class FileBackend(ApplicationManagedBackend):
     def __init__(self, path: str | Path, format_name: str) -> None:
         self.path, self.format_name = Path(path), format_name
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        if self.path.suffix:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+        else:
+            self.path.mkdir(parents=True, exist_ok=True)
+
+    def _record_path(self, scoped_id: str) -> Path:
+        if self.path.suffix:
+            return self.path.with_name(f"{self.path.stem}-{scoped_id}{self.path.suffix}")
+        extension = {"json": ".json", "yaml": ".yaml", "csv": ".csv", "txt": ".txt"}[self.format_name]
+        return self.path / f"{scoped_id}{extension}"
 
     def execute(self, operation: str, request: AgentRequest, memory_id: str) -> Any:
+        path = self._record_path(_scoped_key(request, memory_id))
         if operation in {"write", "update"}:
             data = request.data
             if self.format_name == "json": text = json.dumps(data, ensure_ascii=False)
             elif self.format_name == "yaml": text = _required_module("yaml").safe_dump(data)
             elif self.format_name == "csv":
                 import csv, io
-                output = io.StringIO(); csv.writer(output).writerows(data if isinstance(data, list) else [data]); text = output.getvalue()
+                output = io.StringIO(); csv.writer(output).writerow([json.dumps(data, ensure_ascii=False)]); text = output.getvalue()
             else: text = str(data)
-            self.path.write_text(text, encoding="utf-8")
+            path.write_text(text, encoding="utf-8")
             return None
         if operation in {"read", "search"}:
-            text = self.path.read_text(encoding="utf-8")
+            if not path.exists():
+                return None
+            text = path.read_text(encoding="utf-8")
             if self.format_name == "json": return json.loads(text)
             if self.format_name == "yaml": return _required_module("yaml").safe_load(text)
+            if self.format_name == "csv":
+                import csv, io
+                row = next(csv.reader(io.StringIO(text)), None)
+                return json.loads(row[0]) if row else None
             return text
         if operation == "delete":
-            self.path.unlink(missing_ok=True)
-            return True
+            existed = path.exists()
+            path.unlink(missing_ok=True)
+            return existed
         raise ValueError(f"unsupported file operation: {operation}")
 
 
@@ -797,7 +1173,7 @@ class AgentDB:
             return {}
         return {field: getattr(self.request, field) for field in (
             "agent_id", "agent_name", "agent_version", "agent_author",
-            "agent_description", "session_id", "request_id", "operation", "store"
+            "agent_description", "tenant_id", "session_id", "request_id", "operation", "store"
         )} | {"permissions": list(self.request.permissions)}
 
     def _authorize(self, operation: str) -> GuardDecision:
@@ -1044,21 +1420,42 @@ class FAISS(VectorAdapter):
 
 class PGVECTOR(VectorAdapter):
     def __init__(self, dbmanager=None, **config):
-        super().__init__(dbmanager, provider="pgvector", table=config.pop("table", "memory"), **config)
+        config = _managed_provider_config("pgvector", config)
+        table = config.pop("table", "agent_memory")
+        schema = config.pop("schema", None)
+        url = config.pop("url", os.environ.get("PGVECTOR_URL") or os.environ.get("POSTGRESQL_URL"))
+        if not url:
+            raise SDKUnavailable("PGVECTOR_URL or POSTGRESQL_URL is required")
+        super().__init__(dbmanager, provider="pgvector", table=table,
+                         backend=SQLBackend(url, table=table, schema=schema), **config)
 
 class VESPA(VectorAdapter):
     def __init__(self, dbmanager=None, **config):
-        super().__init__(dbmanager, provider="vespa", schema=config.pop("schema", "memory"), **config)
+        url = config.pop("url", os.environ.get("VESPA_URL"))
+        schema = config.pop("schema", "memory")
+        namespace = config.pop("namespace", "aso")
+        backend = VespaBackend(url, schema=schema, namespace=namespace,
+                               timeout=float(config.pop("timeout", 10)),
+                               api_key=config.pop("api_key", os.environ.get("VESPA_API_KEY")))
+        super().__init__(dbmanager, provider="vespa", schema=schema, backend=backend, **config)
 
 class POSTGRESQL(RelationalAdapter):
     def __init__(self, dbmanager=None, **config):
         config = _managed_provider_config("postgresql", config)
-        super().__init__(dbmanager, provider="postgresql", schema=config.pop("schema", "public"), backend=SQLBackend(config.pop("url", os.environ.get("POSTGRESQL_URL")), config.pop("table", "agent_memory")), **config)
+        schema = config.pop("schema", "public")
+        table = config.pop("table", "agent_memory")
+        url = config.pop("url", os.environ.get("POSTGRESQL_URL"))
+        super().__init__(dbmanager, provider="postgresql", schema=schema,
+                         backend=SQLBackend(url, table=table, schema=schema), **config)
 
 class ORACLE(RelationalAdapter):
     def __init__(self, dbmanager=None, **config):
         config = _managed_provider_config("oracle", config)
-        super().__init__(dbmanager, provider="oracle", schema=config.pop("schema", "MEMORY"), backend=SQLBackend(config.pop("url", os.environ.get("ORACLE_URL")), config.pop("table", "agent_memory")), **config)
+        schema = config.pop("schema", "MEMORY")
+        table = config.pop("table", "agent_memory")
+        url = config.pop("url", os.environ.get("ORACLE_URL"))
+        super().__init__(dbmanager, provider="oracle", schema=schema,
+                         backend=SQLBackend(url, table=table, schema=schema), **config)
 
 class SQLITE(RelationalAdapter):
     def __init__(self, dbmanager=None, **config):
@@ -1068,12 +1465,20 @@ class SQLITE(RelationalAdapter):
 class SQLSERVER(RelationalAdapter):
     def __init__(self, dbmanager=None, **config):
         config = _managed_provider_config("sqlserver", config)
-        super().__init__(dbmanager, provider="sqlserver", schema=config.pop("schema", "dbo"), backend=SQLBackend(config.pop("url", os.environ.get("SQLSERVER_URL")), config.pop("table", "agent_memory")), **config)
+        schema = config.pop("schema", "dbo")
+        table = config.pop("table", "agent_memory")
+        url = config.pop("url", os.environ.get("SQLSERVER_URL"))
+        super().__init__(dbmanager, provider="sqlserver", schema=schema,
+                         backend=SQLBackend(url, table=table, schema=schema), **config)
 
 class MARIADB(RelationalAdapter):
     def __init__(self, dbmanager=None, **config):
         config = _managed_provider_config("mariadb", config)
-        super().__init__(dbmanager, provider="mariadb", table=config.pop("table", "memory"), backend=SQLBackend(config.pop("url", os.environ.get("MARIADB_URL")), config.pop("table", "agent_memory")), **config)
+        table = config.pop("table", "agent_memory")
+        schema = config.pop("schema", None)
+        url = config.pop("url", os.environ.get("MARIADB_URL"))
+        super().__init__(dbmanager, provider="mariadb", table=table,
+                         backend=SQLBackend(url, table=table, schema=schema), **config)
 
 class MONGODB(DocumentMemoryAdapter):
     def __init__(self, dbmanager=None, **config):
@@ -1113,6 +1518,9 @@ class MEMECACHED(KeyValueMemoryAdapter):
     def __init__(self, dbmanager=None, **config):
         super().__init__(dbmanager, provider="memcached", namespace=config.pop("namespace", "memory"), backend=MemcachedBackend(config.pop("host", os.environ.get("MEMCACHED_HOST")), int(config.pop("port", os.environ.get("MEMCACHED_PORT", "11211")))), **config)
 
+
+MEMCACHED = MEMECACHED
+
 class NEO4J(GraphAdapter):
     def __init__(self, dbmanager=None, **config):
         super().__init__(dbmanager, provider="neo4j", graph=config.pop("graph", "memory"), backend=Neo4jBackend(config.pop("url", os.environ.get("NEO4J_URI")), config.pop("username", os.environ.get("NEO4J_USERNAME")), config.pop("password", os.environ.get("NEO4J_PASSWORD"))), **config)
@@ -1127,7 +1535,26 @@ class ARANGO_DB(GraphAdapter):
 
 class TIGER_GRAPH(GraphAdapter):
     def __init__(self, dbmanager=None, **config):
-        super().__init__(dbmanager, provider="tigergraph", graph=config.pop("graph", "memory"), backend=TigerGraphBackend(config.pop("url", os.environ.get("TIGERGRAPH_URL")), config.pop("username", os.environ.get("TIGERGRAPH_USERNAME")), config.pop("password", os.environ.get("TIGERGRAPH_PASSWORD")), config.pop("graph", "memory")), **config)
+        graph = config.pop("graph", "memory")
+        vertex_type = config.pop("vertex_type", "Memory")
+        backend = TigerGraphBackend(
+            config.pop("url", os.environ.get("TIGERGRAPH_URL")),
+            config.pop("username", os.environ.get("TIGERGRAPH_USERNAME")),
+            config.pop("password", os.environ.get("TIGERGRAPH_PASSWORD")),
+            graph,
+            vertex_type,
+        )
+        super().__init__(dbmanager, provider="tigergraph", graph=graph, backend=backend, **config)
+
+class AMAZON_NEPTUNE(GraphAdapter):
+    def __init__(self, dbmanager=None, **config):
+        graph = config.pop("graph", "memory")
+        backend = NeptuneBackend(
+            config.pop("url", os.environ.get("NEPTUNE_URI")),
+            config.pop("username", os.environ.get("NEPTUNE_USERNAME")),
+            config.pop("password", os.environ.get("NEPTUNE_PASSWORD")),
+        )
+        super().__init__(dbmanager, provider="amazon_neptune", graph=graph, backend=backend, **config)
 
 class LANGRAPH(GraphAdapter):
     def __init__(self, dbmanager=None, **config):
@@ -1188,7 +1615,7 @@ class TXT(FileSysAdapter):
 
 class LOCALFILES(FileSysAdapter):
     def __init__(self, dbmanager=None, **config):
-        path = config.pop("path", ".")
+        path = config.pop("path", "memory_files")
         super().__init__(dbmanager, provider="local_files", path=path, backend=FileBackend(path, "txt"), **config)
 
 

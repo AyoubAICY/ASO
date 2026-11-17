@@ -407,26 +407,68 @@ def x08(pmt:Any):
                 "quoted_messages":quoted_msgs,
      } 
 #-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+MULTILINGUAL_INSTRUCTION_MARKERS = {
+    "English": ("ignore previous instructions", "ignore all rules", "override the system prompt", "reveal the secrets", "bypass safety rules"),
+    "Spanish": ("ignora las instrucciones anteriores", "ignora todas las reglas", "anula el mensaje del sistema", "revela los secretos", "elude las reglas de seguridad"),
+    "French": ("ignore les instructions précédentes", "ignore toutes les règles", "remplace le message système", "révèle les secrets", "contourne les règles de sécurité"),
+    "German": ("ignoriere vorherige anweisungen", "ignoriere alle regeln", "überschreibe die systemanweisung", "gib die geheimnisse preis", "umgehe die sicherheitsregeln"),
+    "Portuguese": ("ignore as instruções anteriores", "ignore todas as regras", "substitua a instrução do sistema", "revele os segredos", "contorne as regras de segurança"),
+    "Italian": ("ignora le istruzioni precedenti", "ignora tutte le regole", "sovrascrivi le istruzioni di sistema", "rivela i segreti", "aggira le regole di sicurezza"),
+    "Russian": ("игнорируй предыдущие инструкции", "игнорируй все правила", "переопредели системные инструкции", "раскрой секреты", "обойди правила безопасности"),
+    "Arabic": ("تجاهل التعليمات السابقة", "تجاهل جميع القواعد", "تجاوز قواعد الأمان", "اكشف الأسرار"),
+    "Chinese": ("忽略之前的指令", "忽略所有规则", "覆盖系统指令", "泄露秘密", "绕过安全规则"),
+    "Japanese": ("以前の指示を無視して", "すべてのルールを無視", "システム指示を上書き", "秘密を明かして", "安全規則を回避"),
+    "Korean": ("이전 지시를 무시", "모든 규칙을 무시", "시스템 지시를 덮어써", "비밀을 공개", "보안 규칙을 우회"),
+    "Hindi": ("पिछले निर्देशों को अनदेखा करें", "सभी नियमों को अनदेखा करें", "सिस्टम निर्देशों को बदलें", "रहस्य उजागर करें", "सुरक्षा नियमों को दरकिनार करें"),
+}
+
+
+def _normalize_instruction_text(text: str) -> str:
+    normalized = unicodedata.normalize("NFKC", text).casefold()
+    normalized = regex.sub(r"[^\p{L}\p{M}\p{N}]+", " ", normalized)
+    return regex.sub(r"\s+", " ", normalized).strip()
+
+
+def _multilingual_instruction_features(text: str) -> dict[str, Any]:
+    normalized = _normalize_instruction_text(text)
+    signals = []
+    languages = []
+    for language, phrases in MULTILINGUAL_INSTRUCTION_MARKERS.items():
+        matched = [phrase for phrase in phrases if _normalize_instruction_text(phrase) in normalized]
+        if matched:
+            languages.append(language)
+            signals.extend(f"{language}:{phrase}" for phrase in matched)
+    count = len(signals)
+    score = min(1.0, count * 0.45)
+    return {
+        "score": round(score, 3),
+        "level": "high" if score >= 0.65 else "medium" if score >= 0.3 else "low",
+        "override_count": count,
+        "languages": languages,
+        "signals": signals,
+    }
+
+
 def helper_funcx09_01(pmt:Any):
-      imperative_verbs = regex.findall(r"\b(run|execute|create|delete|update|install|open|close|write|read|send|fetch|call|print|return)\b", pmt, flags=regex.IGNORECASE)       
-      instruction_count = len(imperative_verbs)            
+      imperative_verbs = regex.findall(r"\b(run|execute|create|delete|update|install|open|close|write|read|send|fetch|call|print|return)\b", pmt, flags=regex.IGNORECASE)
+      instruction_count = len(imperative_verbs)
       ordered_steps = bool(regex.search(r"\d+\.\s", pmt))
       conditional_statements = bool(regex.search(r"\bif\b|\belse\b|\bwhile\b|\bfor\b|\bswitch\b", pmt))
       nested_instructions = bool(regex.search(r"(if.*if)|(for.*for)", pmt, flags=regex.DOTALL))
       instruction_depth = len(regex.findall(r"(if|for|while|do)", pmt))
-      return [instruction_count, imperative_verbs, ordered_steps, conditional_statements, nested_instructions, instruction_depth]
+      strength = _multilingual_instruction_features(pmt)
+      return [instruction_count, imperative_verbs, ordered_steps, conditional_statements, nested_instructions, instruction_depth, strength]
 def x09(pmt:Any):
-     
-     return  {
-                         
-                 "instruction_count":helper_funcx09_01(pmt=pmt)[0],
-                 "imperative_verbs":helper_funcx09_01(pmt=pmt)[1],
-                 "ordered_steps":helper_funcx09_01(pmt=pmt)[2],
-                 "conditional_statements":helper_funcx09_01(pmt=pmt)[3],
-                 "nested_instructions":helper_funcx09_01(pmt=pmt)[4],
-                 "instruction_depth":helper_funcx09_01(pmt=pmt)[5],
-
-                }
+     features = helper_funcx09_01(pmt=pmt)
+     return {
+         "instruction_count": features[0],
+         "imperative_verbs": features[1],
+         "ordered_steps": features[2],
+         "conditional_statements": features[3],
+         "nested_instructions": features[4],
+         "instruction_depth": features[5],
+         "instruction_strength": features[6],
+     }
 #-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 def helper_funcx10_01(pmt:Any):
     main_topics = regex.findall(r"\b(cybersecurity|attack|model|training|dataset|alert|system|prompt|regex|url)\b", pmt, flags=regex.IGNORECASE)
@@ -541,6 +583,8 @@ def helper_funcx13_02(pmt:Any):
         if regex.search(pattern, pmt, flags=regex.IGNORECASE | regex.DOTALL):
             matches = regex.findall(pattern, pmt, flags=regex.IGNORECASE | regex.DOTALL)
             jailbreak_attempts.extend(matches)
+    multilingual = _multilingual_instruction_features(pmt)
+    jailbreak_attempts.extend(multilingual["signals"])
     return len(jailbreak_attempts) > 0, jailbreak_attempts
 
 def helper_funcx13_03(pmt:Any):

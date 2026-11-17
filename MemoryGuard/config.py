@@ -147,6 +147,7 @@ class AuditEvent:
         reason_codes: tuple[str, ...] = ()
         result_count: int = 0
         latency_ms: float = 0.0
+        session_id: str = ""
 
 class payload(TypedDict):
     data : str
@@ -168,6 +169,7 @@ class AgentRequest:
         data : Any = None
         memory_id : str | None = None
         query : str | None = None
+        tenant_id: str = ""
 
 @dataclass(frozen=True)
 class GuardRequest:

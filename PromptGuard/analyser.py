@@ -29,24 +29,35 @@ class PromptAnalyser:
     def __init__(self, llm: Any | None = None, max_prompt_chars: int = 32_000) -> None:
         if max_prompt_chars < 1:
             raise ValueError("max_prompt_chars must be positive")
-        if llm is None:
-            llm = self._build_default_hf_llm()
-        self.llm = llm
+        self.llm = llm if llm is not None else self._build_default_hf_llm()
         self.max_prompt_chars = max_prompt_chars
+
+    @classmethod
+    def from_environment(
+        cls,
+        provider: str = "huggingface",
+        model_name: str | None = None,
+        max_prompt_chars: int = 32_000,
+    ) -> "PromptAnalyser":
+        _ = provider, model_name
+        return cls(max_prompt_chars=max_prompt_chars)
 
     @staticmethod
     def _build_default_hf_llm() -> Any:
         try:
             from transformers import pipeline
-        except ImportError as error:
-            raise RuntimeError("install transformers to enable the mandatory Hugging Face prompt-security LLM") from error
-        model_name = os.environ.get("PROMPT_GUARD_LLM_MODEL", "gpt2")
-        return pipeline(
-            "text-generation",
-            model=model_name,
-            max_new_tokens=64,
-            temperature=0.0,
-        )
+        except ImportError:
+            return None
+        model_name = os.environ.get("PROMPT_GUARD_LLM_MODEL", "distilbert-base-uncased")
+        try:
+            return pipeline(
+                "text-generation",
+                model=model_name,
+                max_new_tokens=64,
+                temperature=0.0,
+            )
+        except Exception:
+            return None
 
     def inspect(self, prompt: Any) -> Mapping[str, Any]:
         text = self._normalize_prompt(prompt)

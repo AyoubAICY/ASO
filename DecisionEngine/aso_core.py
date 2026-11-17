@@ -187,6 +187,7 @@ class AgentSecurityOrchestrator:
         secret_broker: Any | None = None,
         secret_context: Any | None = None,
         tool_context: ToolSecurityContext | None = None,
+        tools: Any | None = None,
         agent_name: str | None = None,
         developer_name: str | None = None,
         agent_description: str | None = None,
@@ -218,9 +219,10 @@ class AgentSecurityOrchestrator:
         self._create_schema()
         self.agent = self.create_agent(
             agent_name or f"aso-agent-{uuid.uuid4().hex[:8]}",
-            agent_name or self.llm,
+            self.llm,
             developer_name or "ASO",
             agent_description or self.template,
+            tools=tools,
         )
 
     def _create_schema(self) -> None:
@@ -286,42 +288,57 @@ class AgentSecurityOrchestrator:
         model_name: str,
         developer_name: str,
         description: str,
+        *,
+        tools: Any | None = None,
     ) -> Any:
-        """Create an agent with no tools; tools must be explicitly registered elsewhere."""
+        """Create a framework agent and optionally attach an explicit tool list."""
         if not all((agent_name, model_name, developer_name, description)):
             raise ValueError("agent name, model, developer, and description are required")
         system_prompt = f"{self.template}\n\nAgent description: {description}"
+        tool_list = list(tools or [])
+        if tool_list:
+            if self.tool_guard is None:
+                raise ValueError("configure ToolGuard before attaching framework tools")
+            if any(getattr(tool, "__aso_tool_guard__", None) is not self.tool_guard for tool in tool_list):
+                raise ValueError("framework tools must be created by the configured ToolGuard")
 
         try:
             if self.framework is Framework.LANGCHAIN:
                 ChatOpenAI = getattr(importlib.import_module("langchain_openai"), "ChatOpenAI")
                 create_agent = getattr(importlib.import_module("langchain.agents"), "create_agent")
                 model = ChatOpenAI(model=model_name, temperature=0)
-                agent = create_agent(model=model, tools=[], system_prompt=system_prompt)
+                agent = create_agent(model=model, tools=tool_list, system_prompt=system_prompt)
             elif self.framework is Framework.CREWAI:
                 Agent = getattr(importlib.import_module("crewai"), "Agent")
-                agent = Agent(role=agent_name, goal=description, backstory=description, llm=model_name, allow_delegation=False)
+                agent = Agent(
+                    role=agent_name,
+                    goal=description,
+                    backstory=description,
+                    llm=model_name,
+                    allow_delegation=False,
+                    tools=tool_list,
+                )
             elif self.framework is Framework.GOOGLE_AGENT:
                 Agent = getattr(importlib.import_module("google.adk.agents"), "Agent")
-                agent = Agent(name=agent_name, model=model_name, instruction=system_prompt, tools=[])
+                agent = Agent(name=agent_name, model=model_name, instruction=system_prompt, tools=tool_list)
             elif self.framework is Framework.AUTOGEN_MICROSOFT:
                 AssistantAgent = getattr(importlib.import_module("autogen_agentchat.agents"), "AssistantAgent")
                 OpenAIChatCompletionClient = getattr(
                     importlib.import_module("autogen_ext.models.openai"), "OpenAIChatCompletionClient"
                 )
                 client = OpenAIChatCompletionClient(model=model_name)
-                agent = AssistantAgent(name=agent_name, model_client=client, description=system_prompt, tools=[])
+                agent = AssistantAgent(name=agent_name, model_client=client, description=system_prompt, tools=tool_list)
             elif self.framework is Framework.LLAMAINDEX:
                 OpenAI = getattr(importlib.import_module("llama_index.llms.openai"), "OpenAI")
                 FunctionCallingAgent = getattr(importlib.import_module("llama_index.core.agent"), "FunctionCallingAgent")
                 model = OpenAI(model=model_name)
-                agent = FunctionCallingAgent.from_tools(tools=[], llm=model, system_prompt=system_prompt)
+                agent = FunctionCallingAgent.from_tools(tools=tool_list, llm=model, system_prompt=system_prompt)
             elif self.framework is Framework.PYDANTIC_AI:
                 Agent = getattr(importlib.import_module("pydantic_ai"), "Agent")
-                agent = Agent(model_name, system_prompt=system_prompt, name=agent_name, output_type=str)
+                agent = Agent(model_name, system_prompt=system_prompt, name=agent_name, output_type=str, tools=tool_list)
             else:
                 Agent = getattr(importlib.import_module("agents"), "Agent")
-                agent = Agent(name=agent_name, instructions=system_prompt, model=model_name, tools=[])
+                agent = Agent(name=agent_name, instructions=system_prompt, model=model_name, tools=tool_list)
         except (ImportError, AttributeError) as error:
             raise RuntimeError(f"install and configure the dependency for {self.framework.value}") from error
 
@@ -335,6 +352,23 @@ class AgentSecurityOrchestrator:
         )
         self._store(metadata=metadata)
         return agent
+
+    def create_framework_tool(
+        self,
+        tool_id: str,
+        context: ToolSecurityContext,
+        *,
+        operation: str | None = None,
+    ) -> Any:
+        """Create a framework tool wrapper that routes each call through process()."""
+        if self.tool_guard is None:
+            raise RuntimeError("configure ToolGuard before creating a framework tool")
+        return self.tool_guard._create_framework_tool(
+            tool_id,
+            context,
+            operation,
+            self.process,
+        )
 
     def process(
         self,

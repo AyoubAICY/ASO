@@ -148,10 +148,39 @@ class SecretBroker:
         if row is None:
             return None
         policy = policy_row or {}
-        return SecretDefinition(row["name"], SecretType(row["secret_type"]), row["source"],
-                                frozenset(json.loads(policy.get("operations", "[]"))),
-                                frozenset(json.loads(policy.get("destinations", "[]"))),
-                                bool(row["allowed"]), bool(row["exposed"]), row["secret_id"])
+        operations = SecretBroker._json_set(policy.get("operations"), default=())
+        destinations = SecretBroker._json_set(policy.get("destinations"), default=())
+        if not operations:
+            operations = SecretBroker._json_set(row.get("operations"), default=())
+        if not destinations:
+            destinations = SecretBroker._json_set(row.get("destinations"), default=())
+
+        return SecretDefinition(
+            row["name"],
+            SecretType(row["secret_type"]),
+            row["source"],
+            frozenset(operations),
+            frozenset(destinations),
+            bool(row.get("allowed", True)),
+            bool(row.get("exposed", False)),
+            row["secret_id"],
+        )
+
+    @staticmethod
+    def _json_set(value: Any, *, default: tuple[str, ...] = ()) -> frozenset[str]:
+        if value is None:
+            return frozenset(default)
+        if isinstance(value, (list, tuple, set, frozenset)):
+            return frozenset(str(item).lower() for item in value)
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+            except (TypeError, ValueError):
+                parsed = [value]
+            if isinstance(parsed, (list, tuple, set, frozenset)):
+                return frozenset(str(item).lower() for item in parsed)
+            return frozenset({str(parsed).lower()})
+        return frozenset({str(value).lower()})
 
     @staticmethod
     def _permissions_from_row(row: dict[str, Any] | None) -> SecretPermissions:

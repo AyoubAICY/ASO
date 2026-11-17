@@ -47,6 +47,7 @@ class GuardedMemoryAccessLayer:
         agent_request = AgentRequest(
             agent_id=context.agent_id,
             session_id=context.session_id,
+            tenant_id=context.tenant_id,
             request_id=request.request_id,
             operation=request.operation.value,
             store=request.store_id,

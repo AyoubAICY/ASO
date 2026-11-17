@@ -151,7 +151,13 @@ class LangChainCyberAI(CyberAI):
                 chat_class = __import__("langchain_huggingface", fromlist=["HuggingFacePipeline"]).HuggingFacePipeline
                 model = chat_class(
                     pipeline=__import__("transformers", fromlist=["pipeline"]).pipeline(
-                        model=model_name or os.environ.get("MEMORY_GUARD_LLM_MODEL", "distilbert-base-uncased"),
+                        task="text-generation",
+                        model=model_name or os.environ.get(
+                            "MEMORY_GUARD_LLM_MODEL", "Qwen/Qwen2.5-1.5B-Instruct"
+                        ),
+                        max_new_tokens=128,
+                        do_sample=False,
+                        return_full_text=False,
                     )
                 )
             elif provider_name == "ollama":

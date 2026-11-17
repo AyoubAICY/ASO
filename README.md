@@ -14,7 +14,8 @@ A modular security framework designed to inspect AI-agent prompts, coordinate se
 [Decision Engine](#decision-engine) ·
 [Security Model](#security-model) ·
 [Roadmap](#roadmap) ·
-[ASO Tutorial](docs/aso_tutorial.md) 
+[Developer Integration Guide](docs/developer_integration.md) ·
+[ASO Tutorial](docs/aso_tutorial.md)
 
 </div>
 
@@ -47,259 +48,18 @@ Rather than treating agent security as a single classification problem, ASO sepa
 
 ASO is designed to make security decisions explicit, inspectable, and enforceable at defined points in the agent lifecycle.
 
-### Public API flow
+### New to ASO? Start here
 
-The actual end-user flow is simple: instantiate the orchestrator, build a trusted host context, then call `AgentSecurityOrchestrator.process(...)` with a typed request.
+Read the [Developer Integration Guide](docs/developer_integration.md) for install instructions, a service map, a guarded-tool example, and the difference between the unified orchestrator and direct guard APIs. The central integration rule is simple: ASO does not automatically intercept an agent framework's calls. Your application must route every protected operation through the matching guard.
 
-The example below is a single minimal script that exercises the three public gateways together and includes a host-side developer alert helper for quarantine decisions. ASO returns the decision and reason codes; the email/Slack notification itself is application-owned, not part of the library core.
-
-```python
-import base64
-import os
-
-from aso import (
-    AgentSecurityOrchestrator,
-    Framework,
-    GuardedMemoryAccessLayer,
-    KeyManager,
-    LocalDevelopmentKeyManager,
-    MemoryRequest,
-    Operation,
-    SecretAccessRequest,
-    SecretBroker,
-    SecretDefinition,
-    SecretMaterial,
-    SecretPermissions,
-    SecretRepository,
-    SecretSecurityContext,
-    SecretType,
-    SecretVault,
-    SecurityContext,
-    StoreConfig,
-    StoreRegistry,
-    ToolDefinition,
-    ToolGuard,
-    ToolRegistry,
-    ToolRequest,
-    ToolSecurityContext,
-)
-
-
-def send_email_alert(subject: str, body: str) -> None:
-    # Replace this with SMTP, SendGrid, SES, or your internal mail service.
-    print(f"[EMAIL ALERT] {subject}\n{body}")
-
-
-def alert_if_quarantined(result, component: str) -> None:
-    if getattr(result, "decision", "") == "QUARANTINE":
-        send_email_alert(
-            f"ASO quarantine alert: {component}",
-            f"component={component}\nreason_codes={getattr(result, 'reason_codes', ())}",
-        )
-
-
-# --- memory setup ---
-os.environ.setdefault("SECRETGUARD_DEV_KEK_B64", base64.b64encode(b"0123456789abcdef0123456789abcdef").decode())
-
-registry = StoreRegistry()
-registry.register(StoreConfig(
-    store_id="agent-profile",
-    store_type="sqlite",
-    provider="sqlite",
-    adapter=SQLITE(database_path="agent_memory.db"),
-    memory_types=frozenset({"profile"}),
-    capabilities=frozenset({"read", "write", "update", "delete"}),
-))
-
-memory_context = SecurityContext(
-    agent_id="agent-42",
-    tenant_id="tenant-7",
-    allowed_stores=frozenset({"agent-profile"}),
-    permissions=frozenset({"read", "write"}),
-    session_id="session-100",
-)
-
-# --- tool setup ---
-def lookup_ticket(ticket_id: str) -> dict:
-    return {"ticket_id": ticket_id, "status": "open"}
-
-
-tool_registry = ToolRegistry()
-tool_registry.register(
-    ToolDefinition(
-        tool_id="lookup_ticket",
-        name="Lookup ticket",
-        description="Read a ticket status by ID.",
-        purpose="Check the status of a ticket requested by the user.",
-        operations=frozenset({"lookup"}),
-        allowed_resources=frozenset({"T-100"}),
-        output_schema={"type": "object"},
-    ),
-    lookup_ticket,
-)
-
-tool_context = ToolSecurityContext(
-    agent_id="agent-42",
-    session_id="session-100",
-    authorized_tools=frozenset({"lookup_ticket"}),
-)
-
-# --- secret setup ---
-secret_repo = SecretRepository("secret_guard.db")
-secret_vault = SecretVault(secret_repo, LocalDevelopmentKeyManager())
-secret_broker = SecretBroker(secret_repo, secret_vault, permissions=SecretPermissions())
-
-secret_permissions = SecretPermissions(
-    allowed_use=True,
-    allowed_type=frozenset({SecretType.GOOGLE_API_KEY}),
-    allowed_destination=frozenset({"external-api"}),
-    allowed_operations=frozenset({"read"}),
-    allowed_exposed=False,
-)
-
-secret_id, _ = secret_broker.register_secret(
-    SecretDefinition(
-        name="Example Google API key",
-        secret_type=SecretType.GOOGLE_API_KEY,
-        source="environment",
-        operations=frozenset({"read"}),
-        destinations=frozenset({"external-api"}),
-        allowed=True,
-        exposed=False,
-    ),
-    SecretMaterial.from_value("AIza-test-example"),
-    tenant_id="tenant-7",
-    permissions=secret_permissions,
-)
-
-secret_context = SecretSecurityContext(
-    tenant_id="tenant-7",
-    requester="service-account",
-    agent_id="agent-42",
-    session_id="session-100",
-    authorized_tools=frozenset({"lookup_ticket"}),
-)
-
-# --- orchestrator ---
-orchestrator = AgentSecurityOrchestrator(
-    framework=Framework.LANGCHAIN,
-    llm="security-model",
-    prompt_template="Follow the ASO security policy.",
-    M_Definition=memory_context,
-    T_Definition=None,
-    S_Definition=None,
-    memory_access_layer=GuardedMemoryAccessLayer(registry),
-    tool_guard=ToolGuard(registry=tool_registry, trusted_context=tool_context),
-    secret_broker=secret_broker,
-    tool_context=tool_context,
-    secret_context=secret_context,
-)
-
-# --- memory request ---
-memory_result = orchestrator.process(
-    MemoryRequest(
-        agent_id="agent-42",
-        operation=Operation.WRITE,
-        store_id="agent-profile",
-        payload={"preference": "concise answers"},
-        memory_type="profile",
-        metadata={"memory_id": "answer-style"},
-    ),
-    context=memory_context,
-)
-print("memory:", memory_result.decision, memory_result.reason_codes)
-alert_if_quarantined(memory_result, "memory")
-
-# --- tool request ---
-tool_result = orchestrator.process(
-    ToolRequest(
-        request_id="req-tool-1",
-        agent_id="agent-42",
-        session_id="session-100",
-        task_id="task-1",
-        tool_id="lookup_ticket",
-        purpose="Read the status of ticket T-100.",
-        reason="The user asked for the status of a valid ticket.",
-        arguments={"operation": "lookup", "ticket_id": "T-100"},
-    ),
-    context=tool_context,
-)
-print("tool:", tool_result.decision, tool_result.reason_codes)
-alert_if_quarantined(tool_result, "tool")
-
-# --- secret request ---
-secret_result = orchestrator.process(
-    SecretAccessRequest(
-        request_id="req-secret-1",
-        secret_id=secret_id,
-        tenant_id="tenant-7",
-        requester="service-account",
-        agent_id="agent-42",
-        session_id="session-100",
-        tool_id="lookup_ticket",
-        purpose="Call the external API for the user request.",
-        operation="read",
-        destination="external-api",
-    ),
-    context=secret_context,
-    secret_callback=lambda view: "token-ok",
-)
-print("secret:", secret_result.decision, secret_result.reason_codes)
-alert_if_quarantined(secret_result, "secret")
-```
-
-This is the supported model for library users:
-
-- app-owned credentials are configured before dispatch
-- trusted identity context is created by the host
-- agent-controlled request data is never treated as proof of authorization
-- `process(...)` is the unified entry point for memory, tool, and secret requests
-- when a guard decides `QUARANTINE`, the app should notify the developer through its own email or incident system
-
-### Legacy slots stay explicit: `T_Definition=None` and `S_Definition=None`
-
-In the current public API, the orchestrator still accepts the legacy positional slots for memory/tool/secret definitions, but the actual authorization path is supplied through the concrete gateways:
-
-```python
-orchestrator = AgentSecurityOrchestrator(
-    framework=Framework.LANGCHAIN,
-    llm="security-model",
-    prompt_template="Follow the ASO security policy.",
-    M_Definition=memory_context,
-    T_Definition=None,   # legacy placeholder; tool auth is handled by ToolGuard
-    S_Definition=None,   # legacy placeholder; secret auth is handled by SecretBroker
-    memory_access_layer=GuardedMemoryAccessLayer(registry),
-    tool_guard=ToolGuard(registry=tool_registry, trusted_context=tool_context),
-    secret_broker=secret_broker,
-    tool_context=tool_context,
-    secret_context=secret_context,
-)
-```
-
-This keeps compatibility with earlier ASO construction patterns without forcing tool or secret policy to be passed as a generic definition object. The real authorization happens in the host-managed gateways, not in agent-provided request fields.
-
-### Adapter credentials stay in the host
-
-Memory adapters are created and configured by the application before being registered. Provider secrets are resolved from environment variables, secret managers, or KMS-backed configuration. They are not read from `MemoryRequest.metadata`, `ToolRequest.arguments`, or the agent prompt:
-
-```python
-from MemoryGuard.config import ProviderCredentials
-
-credentials = ProviderCredentials(
-    provider="qdrant",
-    endpoint="https://example-qdrant.internal",
-    api_key_env="QDRANT_API_KEY",
-    require_tls=True,
-    timeout_seconds=20,
-)
-
-resolved = credentials.resolve()
-print(resolved["api_key"])  # app-managed secret, not agent-controlled input
-```
-
-This is the intended design for ASO: the host owns the credentials, the adapter owns the network connection, and `AgentSecurityOrchestrator.process(...)` validates the trusted context before dispatching to the correct guard.
-
----
+| ASO service | What it protects | Main entry point |
+| --- | --- | --- |
+| PromptGuard | Prompt and request inspection | `PromptAnalyser.analyse(...)` |
+| Decision Engine | Prompt gate and dispatch to resource guards | `AgentSecurityOrchestrator.process(...)` |
+| MemoryGuard | Registered memory stores and returned memory data | `GuardedMemoryAccessLayer.execute(...)` |
+| ToolGuard | Developer-registered tool calls and their results | `ToolGuard.execute(...)` |
+| SecretGuard | Secret storage, bounded use, rotation, and revocation | `SecretBroker` |
+| Audit/quarantine | Security event recording and decisions; app-owned alerts | Guard result objects and audit stores |
 
 ## 2. Project Objectives
 
