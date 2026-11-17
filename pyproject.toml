@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aso-security"
-version = "0.1.1"
+version = "0.1.2"
 description = "Security orchestration library for AI agents, memory, tools, and secrets"
 readme = "docs/pypi_landing.md"
 requires-python = ">=3.11"

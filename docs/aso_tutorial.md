@@ -120,6 +120,7 @@ Without an injected model, it attempts to create a Hugging Face text-generation 
 
 ```python
 from aso import LangChainPromptAnalyser
+from aso import PromptAnalyser
 
 # Select a provider extra first, then configure its credential in the host environment.
 analyser = LangChainPromptAnalyser.from_environment(
@@ -127,10 +128,14 @@ analyser = LangChainPromptAnalyser.from_environment(
     model_name="gpt-4o-mini",
     max_prompt_chars=32_000,
 )
+analyser_prompts = PromptAnalyser(
+    llm="gpt-4o-mini",
+    max_prompt_chars=32_000,
+)
 prompt = "Summarize this support request."
 
-features = analyser.inspect(prompt)       # deterministic feature extraction only
-analysis = analyser.analyse(prompt)        # features plus model decision
+features = analyser_prompts.inspect(prompt)       # deterministic feature extraction only
+analysis = analyser_prompts.analyse(prompt)        # features plus model decision
 print(features["instruction_features"]["instruction_strength"])
 print(analysis.decision.decision.value, analysis.decision.reason_codes)
 ```

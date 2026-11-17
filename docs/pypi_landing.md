@@ -199,10 +199,14 @@ analyser = LangChainPromptAnalyser.from_environment(
     model_name="gpt-4o-mini",
     max_prompt_chars=32_000,
 )
+analyser_prompts = PromptAnalyser(
+    llm="gpt-4o-mini",
+    max_prompt_chars=32_000,
+)
 prompt = "Summarize this support ticket."
 
-features = analyser.inspect(prompt)  # Feature extraction only; does not decide authorization.
-analysis = analyser.analyse(prompt)
+features = analyser_prompts.inspect(prompt)  # Feature extraction only; does not decide authorization.
+analysis = analyser_prompts.analyse(prompt)
 if analysis.decision.decision.value != "ALLOW":
     raise PermissionError(f"PromptGuard blocked this prompt: {analysis.decision.reason_codes}")
 ```
